@@ -4,7 +4,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::thread;
@@ -91,6 +91,21 @@ enum ViewMode {
     Treemap,
 }
 
+/// Etat partagé de progression du scan (octets totaux / scannés)
+struct ScanProgress {
+    total_bytes: AtomicU64,
+    scanned_bytes: AtomicU64,
+}
+
+impl Default for ScanProgress {
+    fn default() -> Self {
+        Self {
+            total_bytes: AtomicU64::new(0),
+            scanned_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
 struct TreeSizeApp {
     root_path: Option<PathBuf>,
     root_node: Option<Node>,
@@ -115,6 +130,9 @@ struct TreeSizeApp {
     clipboard_path: Option<PathBuf>,
     clipboard_is_cut: bool,
     pending_paste_dest: Option<PathBuf>,
+
+    // Progression
+    scan_progress: Option<Arc<ScanProgress>>,
 }
 
 impl Default for TreeSizeApp {
@@ -138,6 +156,7 @@ impl Default for TreeSizeApp {
             clipboard_path: None,
             clipboard_is_cut: false,
             pending_paste_dest: None,
+            scan_progress: None,
         }
     }
 }
@@ -178,7 +197,7 @@ impl TreeSizeApp {
 
     fn draw_top_bar(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar")
-            .exact_height(60.0)
+            .exact_height(70.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("TreeSize Rust");
@@ -198,7 +217,33 @@ impl TreeSizeApp {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if self.is_scanning {
-                                ui.spinner();
+                                if let Some(progress) =
+                                    &self.scan_progress
+                                {
+                                    let total = progress
+                                        .total_bytes
+                                        .load(Ordering::Relaxed);
+                                    let scanned = progress
+                                        .scanned_bytes
+                                        .load(Ordering::Relaxed);
+
+                                    if total > 0 {
+                                        let frac = (scanned as f32
+                                            / total as f32)
+                                            .min(1.0);
+                                        ui.add(
+                                            egui::ProgressBar::new(
+                                                frac,
+                                            )
+                                            .desired_width(160.0)
+                                            .show_percentage(),
+                                        );
+                                    } else {
+                                        ui.spinner();
+                                    }
+                                } else {
+                                    ui.spinner();
+                                }
                                 ui.label("Scan en cours…");
                             } else {
                                 ui.label("Prêt");
@@ -375,6 +420,37 @@ impl TreeSizeApp {
                             }
                         }
                     });
+
+                    if self.is_scanning {
+                        if let Some(progress) = &self.scan_progress {
+                            let total = progress
+                                .total_bytes
+                                .load(Ordering::Relaxed);
+                            let scanned = progress
+                                .scanned_bytes
+                                .load(Ordering::Relaxed);
+                            if total > 0 {
+                                let frac = (scanned as f32
+                                    / total as f32)
+                                    .min(1.0);
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .show_percentage(),
+                                );
+                                ui.small(format!(
+                                    "{} / {}",
+                                    format_bytes(scanned),
+                                    format_bytes(total),
+                                ));
+                            } else {
+                                ui.add_space(6.0);
+                                ui.small(
+                                    "Pré-analyse en cours (estimation du volume total)…",
+                                );
+                            }
+                        }
+                    }
                 });
 
                 section_card(ui, "Vue", |ui| {
@@ -620,11 +696,16 @@ impl TreeSizeApp {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
 
+        let progress = Arc::new(ScanProgress::default());
+        let progress_clone = progress.clone();
+
         self.scan_receiver = Some(rx);
         self.cancel_flag = Some(cancel);
+        self.scan_progress = Some(progress);
 
         thread::spawn(move || {
-            let result = scan_directory_parallel(&path, &cancel_clone);
+            let result =
+                scan_directory_parallel(&path, &cancel_clone, &progress_clone);
             let _ = tx.send(result);
         });
     }
@@ -688,10 +769,11 @@ impl eframe::App for TreeSizeApp {
                     self.is_scanning = false;
                     self.scan_receiver = None;
                     self.cancel_flag = None;
+                    self.scan_progress = None;
 
                     if let Some(err) = result.error {
                         self.root_node = None;
-                        self.status = err;
+                            self.status = err;
                     } else {
                         self.root_node = result.root_node;
                         self.status = format!(
@@ -1206,8 +1288,58 @@ fn pick_directory() -> Option<PathBuf> {
     rfd::FileDialog::new().pick_folder()
 }
 
-/// Scan récursif avec parallélisation et support d'annulation.
-fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
+/// Pré-analyse : calcule la taille totale des fichiers sous root.
+fn compute_total_bytes(root: &Path, cancel: &AtomicBool) -> u64 {
+    if cancel.load(Ordering::Relaxed) {
+        return 0;
+    }
+
+    let mut direct_children: Vec<PathBuf> = Vec::new();
+    if let Ok(read_dir) = root.read_dir() {
+        for entry in read_dir.flatten() {
+            direct_children.push(entry.path());
+        }
+    } else {
+        return 0;
+    }
+
+    direct_children
+        .par_iter()
+        .map(|path| compute_path_size(path, cancel))
+        .sum()
+}
+
+/// Taille d’un chemin (fichier ou dossier) pour la pré-analyse.
+fn compute_path_size(path: &Path, cancel: &AtomicBool) -> u64 {
+    if cancel.load(Ordering::Relaxed) {
+        return 0;
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.is_file() {
+            return meta.len();
+        } else if meta.is_dir() {
+            let mut entries: Vec<PathBuf> = Vec::new();
+            if let Ok(read_dir) = path.read_dir() {
+                for entry in read_dir.flatten() {
+                    entries.push(entry.path());
+                }
+            }
+            return entries
+                .par_iter()
+                .map(|p| compute_path_size(p, cancel))
+                .sum();
+        }
+    }
+    0
+}
+
+/// Scan récursif avec parallélisation, support d'annulation et progression.
+fn scan_directory_parallel(
+    root: &Path,
+    cancel: &AtomicBool,
+    progress: &ScanProgress,
+) -> ScanResult {
     if cancel.load(Ordering::Relaxed) {
         return ScanResult {
             root_path: root.to_path_buf(),
@@ -1234,6 +1366,20 @@ fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
         };
     }
 
+    // Phase 1 : pré-analyse pour estimer le volume total
+    let total_bytes = compute_total_bytes(root, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return ScanResult {
+            root_path: root.to_path_buf(),
+            root_node: None,
+            error: Some("Scan annulé".to_string()),
+        };
+    }
+    progress
+        .total_bytes
+        .store(total_bytes, Ordering::Relaxed);
+
+    // Phase 2 : scan réel + construction de l'arbre
     let mut direct_children: Vec<PathBuf> = Vec::new();
     match root.read_dir() {
         Ok(read_dir) => {
@@ -1258,7 +1404,7 @@ fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            build_node(path, cancel).ok()
+            build_node(path, cancel, progress).ok()
         })
         .collect();
 
@@ -1284,14 +1430,24 @@ fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
     }
 }
 
-/// Construit un Node (fichier ou dossier) pour un chemin donné.
-fn build_node(path: &Path, cancel: &AtomicBool) -> Result<Node, String> {
+/// Construit un Node (fichier ou dossier) pour un chemin donné, en mettant à jour la progression.
+fn build_node(
+    path: &Path,
+    cancel: &AtomicBool,
+    progress: &ScanProgress,
+) -> Result<Node, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Annulé".to_string());
     }
 
     if path.is_file() {
         let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        // Mise à jour progression
+        if size > 0 {
+            progress
+                .scanned_bytes
+                .fetch_add(size, Ordering::Relaxed);
+        }
         let name = path
             .file_name()
             .map(|os| os.to_string_lossy().to_string())
@@ -1316,7 +1472,7 @@ fn build_node(path: &Path, cancel: &AtomicBool) -> Result<Node, String> {
                 if cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                build_node(p, cancel).ok()
+                build_node(p, cancel, progress).ok()
             })
             .collect();
 
