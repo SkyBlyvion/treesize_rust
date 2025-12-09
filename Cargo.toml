@@ -15,3 +15,6 @@ rfd = "0.14"
 
 # Pour les threads & canaux
 crossbeam-channel = "0.5"
+
+# Pour récupérer le home directory (Linux/macOS/Windows)
+dirs = "5.0"
