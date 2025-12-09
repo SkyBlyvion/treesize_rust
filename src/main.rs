@@ -202,7 +202,10 @@ impl eframe::App for TreeSizeApp {
                         }
 
                         if ui
-                            .add_enabled(!self.is_scanning, egui::Button::new("Choisir un dossier…"))
+                            .add_enabled(
+                                !self.is_scanning,
+                                egui::Button::new("Choisir un dossier…"),
+                            )
                             .clicked()
                         {
                             if let Some(path) = pick_directory() {
@@ -353,7 +356,6 @@ impl eframe::App for TreeSizeApp {
                         ui.weak("Presse-papier vide.");
                     }
                 }
-
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -616,8 +618,18 @@ fn draw_node_recursive(
         )
     };
 
+    let is_selected = selected_node_path
+        .as_ref()
+        .map_or(false, |p| p == &node.path);
+
     if node.is_dir {
-        let header = egui::CollapsingHeader::new(label)
+        let header_label = if is_selected {
+            egui::RichText::new(label.clone()).strong()
+        } else {
+            egui::RichText::new(label.clone())
+        };
+
+        let header = egui::CollapsingHeader::new(header_label)
             .default_open(indent_level == 0)
             .id_source(node.path.to_string_lossy().to_string());
 
@@ -687,9 +699,9 @@ fn draw_node_recursive(
         let resp = ui
             .horizontal(|ui| {
                 ui.add_space(indent + 10.0);
-                ui.label(label);
+                ui.selectable_label(is_selected, label)
             })
-            .response;
+            .inner;
 
         if resp.clicked() {
             *selected_node_path = Some(node.path.clone());
@@ -715,6 +727,17 @@ fn draw_node_recursive(
                 *clipboard_is_cut = true;
                 ui.close_menu();
             }
+
+            // Coller dans le même dossier que ce fichier
+            if clipboard_path.is_some() {
+                if let Some(parent) = node.path.parent() {
+                    if ui.button("Coller ici").clicked() {
+                        *pending_paste_dest = Some(parent.to_path_buf());
+                        ui.close_menu();
+                    }
+                }
+            }
+
             if ui
                 .button(
                     egui::RichText::new("Supprimer…")
@@ -846,12 +869,23 @@ fn draw_treemap(
                     *clipboard_is_cut = true;
                     ui.close_menu();
                 }
-                if hit.is_dir && clipboard_path.is_some() {
-                    if ui.button("Coller ici").clicked() {
-                        *pending_paste_dest = Some(hit.path.clone());
-                        ui.close_menu();
+
+                // Coller ici : si on est sur un dossier => dedans, sinon => dans le parent du fichier
+                if clipboard_path.is_some() {
+                    let dest_dir = if hit.is_dir {
+                        Some(hit.path.clone())
+                    } else {
+                        hit.path.parent().map(|p| p.to_path_buf())
+                    };
+
+                    if let Some(dest) = dest_dir {
+                        if ui.button("Coller ici").clicked() {
+                            *pending_paste_dest = Some(dest);
+                            ui.close_menu();
+                        }
                     }
                 }
+
                 if ui
                     .button(
                         egui::RichText::new("Supprimer…")
@@ -918,7 +952,6 @@ fn layout_treemap_rect(
                 egui::pos2(rect.right(), y2),
             )
         };
-
 
         if r.width() < 2.0 || r.height() < 2.0 {
             continue;
@@ -1148,6 +1181,17 @@ fn delete_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn is_path_too_long(path: &Path) -> bool {
+    // Windows classique ~260 caractères (MAX_PATH)
+    path.to_string_lossy().len() > 260
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_path_too_long(_path: &Path) -> bool {
+    false
+}
+
 /// Copie/déplacement de fichier ou dossier dans un dossier cible.
 fn copy_or_move(src: &Path, dest_dir: &Path, is_cut: bool) -> Result<(), String> {
     if !dest_dir.exists() || !dest_dir.is_dir() {
@@ -1171,6 +1215,14 @@ fn copy_or_move(src: &Path, dest_dir: &Path, is_cut: bool) -> Result<(), String>
         .file_name()
         .unwrap_or_else(|| OsStr::new("unnamed"));
     let dest_path = dest_dir.join(file_name);
+
+    if is_path_too_long(&dest_path) {
+        return Err(format!(
+            "Chemin de destination trop long pour le système ({} caractères).\n{}",
+            dest_path.to_string_lossy().len(),
+            dest_path.to_string_lossy()
+        ));
+    }
 
     if is_cut {
         match fs::rename(src, &dest_path) {
