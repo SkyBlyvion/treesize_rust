@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -109,6 +110,11 @@ struct TreeSizeApp {
 
     // Suppression
     pending_delete: Option<PathBuf>,
+
+    // Clipboard interne pour copier/couper/coller
+    clipboard_path: Option<PathBuf>,
+    clipboard_is_cut: bool,
+    pending_paste_dest: Option<PathBuf>,
 }
 
 impl Default for TreeSizeApp {
@@ -129,6 +135,9 @@ impl Default for TreeSizeApp {
             view_mode: ViewMode::Tree,
             selected_node_path: None,
             pending_delete: None,
+            clipboard_path: None,
+            clipboard_is_cut: false,
+            pending_paste_dest: None,
         }
     }
 }
@@ -234,7 +243,6 @@ impl eframe::App for TreeSizeApp {
                                     }
                                 });
 
-                            // Met à jour root_path pour le scan
                             self.root_path =
                                 Some(current_root.to_path_buf());
                         }
@@ -324,13 +332,36 @@ impl eframe::App for TreeSizeApp {
                     ui.weak("Aucun élément sélectionné.");
                 }
 
+                ui.add_space(8.0);
+                ui.separator();
+
+                ui.heading("Presse-papier (fichiers/dossiers)");
+                match &self.clipboard_path {
+                    Some(p) => {
+                        ui.label(if self.clipboard_is_cut {
+                            "Mode : Couper"
+                        } else {
+                            "Mode : Copier"
+                        });
+                        ui.monospace(p.to_string_lossy());
+                        if ui.button("Vider le presse-papier").clicked() {
+                            self.clipboard_path = None;
+                            self.clipboard_is_cut = false;
+                        }
+                    }
+                    None => {
+                        ui.weak("Presse-papier vide.");
+                    }
+                }
+
+
                 ui.add_space(12.0);
                 ui.separator();
 
                 ui.heading("Infos");
                 ui.small(
                     "• Clic gauche sur un élément (arbo ou treemap) pour le sélectionner.\n\
-                     • Clic droit pour le menu contextuel (Propriétés / Copier chemin / Supprimer…).\n\
+                     • Clic droit pour le menu contextuel (Propriétés / Copier chemin / Copier / Couper / Supprimer / Coller ici).\n\
                      • Les erreurs d'accès (permissions, fichiers spéciaux...) sont ignorées.\n\
                      • L'arrêt du scan est coopératif.",
                 );
@@ -380,6 +411,9 @@ impl eframe::App for TreeSizeApp {
                                     0,
                                     &mut self.selected_node_path,
                                     &mut self.pending_delete,
+                                    &mut self.clipboard_path,
+                                    &mut self.clipboard_is_cut,
+                                    &mut self.pending_paste_dest,
                                 );
                             });
                     }
@@ -396,6 +430,9 @@ impl eframe::App for TreeSizeApp {
                             root,
                             &mut self.selected_node_path,
                             &mut self.pending_delete,
+                            &mut self.clipboard_path,
+                            &mut self.clipboard_is_cut,
+                            &mut self.pending_paste_dest,
                         );
                     }
                 }
@@ -432,8 +469,10 @@ impl eframe::App for TreeSizeApp {
                             close = true;
                         }
                         if ui
-                            .button(egui::RichText::new("Supprimer")
-                                .color(egui::Color32::RED))
+                            .button(
+                                egui::RichText::new("Supprimer")
+                                    .color(egui::Color32::RED),
+                            )
                             .clicked()
                         {
                             match delete_path(&path) {
@@ -442,7 +481,6 @@ impl eframe::App for TreeSizeApp {
                                         "Supprimé : {}",
                                         path.to_string_lossy()
                                     );
-                                    // On recalcule l'arbo si possible
                                     if let Some(root) =
                                         self.root_path.clone()
                                     {
@@ -462,9 +500,14 @@ impl eframe::App for TreeSizeApp {
                     });
 
                     if close {
-                        // la fenêtre disparaîtra au prochain frame car pending_delete = None
+                        // la fenêtre disparaîtra car pending_delete = None
                     }
                 });
+        }
+
+        // Traitement différé du "Coller ici"
+        if let Some(dest) = self.pending_paste_dest.take() {
+            self.handle_paste(&dest);
         }
     }
 }
@@ -498,6 +541,43 @@ impl TreeSizeApp {
         let path = self.selected_node_path.as_ref()?;
         find_node_by_path(root, path)
     }
+
+    fn handle_paste(&mut self, dest_dir: &Path) {
+        let src = match self.clipboard_path.clone() {
+            Some(p) => p,
+            None => {
+                self.status = "Presse-papier vide, rien à coller.".to_string();
+                return;
+            }
+        };
+
+        let is_cut = self.clipboard_is_cut;
+
+        match copy_or_move(&src, dest_dir, is_cut) {
+            Ok(()) => {
+                if is_cut {
+                    self.clipboard_path = None;
+                    self.clipboard_is_cut = false;
+                    self.status = format!(
+                        "Déplacé vers : {}",
+                        dest_dir.to_string_lossy()
+                    );
+                } else {
+                    self.status = format!(
+                        "Copié vers : {}",
+                        dest_dir.to_string_lossy()
+                    );
+                }
+
+                if let Some(root) = self.root_path.clone() {
+                    self.start_scan(root);
+                }
+            }
+            Err(e) => {
+                self.status = format!("Erreur copie/déplacement : {}", e);
+            }
+        }
+    }
 }
 
 /// Dessin récursif d'un Node en arbre (vue arborescence) + clic gauche/droit.
@@ -508,6 +588,9 @@ fn draw_node_recursive(
     indent_level: usize,
     selected_node_path: &mut Option<PathBuf>,
     pending_delete: &mut Option<PathBuf>,
+    clipboard_path: &mut Option<PathBuf>,
+    clipboard_is_cut: &mut bool,
+    pending_paste_dest: &mut Option<PathBuf>,
 ) {
     let indent = 18.0 * indent_level as f32;
     let percentage = if root_size > 0 {
@@ -549,6 +632,9 @@ fn draw_node_recursive(
                         indent_level + 1,
                         selected_node_path,
                         pending_delete,
+                        clipboard_path,
+                        clipboard_is_cut,
+                        pending_paste_dest,
                     );
                 });
             }
@@ -556,12 +642,10 @@ fn draw_node_recursive(
 
         let header_resp = collapsing.header_response;
 
-        // Clic gauche => sélection
         if header_resp.clicked() {
             *selected_node_path = Some(node.path.clone());
         }
 
-        // Clic droit => menu contextuel
         header_resp.context_menu(|ui| {
             if ui.button("Propriétés").clicked() {
                 *selected_node_path = Some(node.path.clone());
@@ -571,6 +655,22 @@ fn draw_node_recursive(
                 let text = node.path.to_string_lossy().to_string();
                 ui.output_mut(|o| o.copied_text = text);
                 ui.close_menu();
+            }
+            if ui.button("Copier").clicked() {
+                *clipboard_path = Some(node.path.clone());
+                *clipboard_is_cut = false;
+                ui.close_menu();
+            }
+            if ui.button("Couper").clicked() {
+                *clipboard_path = Some(node.path.clone());
+                *clipboard_is_cut = true;
+                ui.close_menu();
+            }
+            if clipboard_path.is_some() {
+                if ui.button("Coller ici").clicked() {
+                    *pending_paste_dest = Some(node.path.clone());
+                    ui.close_menu();
+                }
             }
             if ui
                 .button(
@@ -605,6 +705,16 @@ fn draw_node_recursive(
                 ui.output_mut(|o| o.copied_text = text);
                 ui.close_menu();
             }
+            if ui.button("Copier").clicked() {
+                *clipboard_path = Some(node.path.clone());
+                *clipboard_is_cut = false;
+                ui.close_menu();
+            }
+            if ui.button("Couper").clicked() {
+                *clipboard_path = Some(node.path.clone());
+                *clipboard_is_cut = true;
+                ui.close_menu();
+            }
             if ui
                 .button(
                     egui::RichText::new("Supprimer…")
@@ -625,6 +735,7 @@ struct Hit {
     path: PathBuf,
     name: String,
     size: u64,
+    is_dir: bool,
 }
 
 /// Dessin de la treemap façon WinDirStat + clic gauche/droit.
@@ -633,6 +744,9 @@ fn draw_treemap(
     root: &Node,
     selected_path: &mut Option<PathBuf>,
     pending_delete: &mut Option<PathBuf>,
+    clipboard_path: &mut Option<PathBuf>,
+    clipboard_is_cut: &mut bool,
+    pending_paste_dest: &mut Option<PathBuf>,
 ) {
     let total_size = root.size.max(1);
 
@@ -722,6 +836,22 @@ fn draw_treemap(
                     ui.output_mut(|o| o.copied_text = text);
                     ui.close_menu();
                 }
+                if ui.button("Copier").clicked() {
+                    *clipboard_path = Some(hit.path.clone());
+                    *clipboard_is_cut = false;
+                    ui.close_menu();
+                }
+                if ui.button("Couper").clicked() {
+                    *clipboard_path = Some(hit.path.clone());
+                    *clipboard_is_cut = true;
+                    ui.close_menu();
+                }
+                if hit.is_dir && clipboard_path.is_some() {
+                    if ui.button("Coller ici").clicked() {
+                        *pending_paste_dest = Some(hit.path.clone());
+                        ui.close_menu();
+                    }
+                }
                 if ui
                     .button(
                         egui::RichText::new("Supprimer…")
@@ -769,26 +899,26 @@ fn layout_treemap_rect(
             continue;
         }
 
-        let mut r = rect;
-        if horizontal {
+        let r = if horizontal {
             let w = rect.width() * fraction;
             let x1 = offset;
             let x2 = (offset + w).min(rect.right());
-            r = egui::Rect::from_min_max(
+            offset += w;
+            egui::Rect::from_min_max(
                 egui::pos2(x1, rect.top()),
                 egui::pos2(x2, rect.bottom()),
-            );
-            offset += w;
+            )
         } else {
             let h = rect.height() * fraction;
             let y1 = offset;
             let y2 = (offset + h).min(rect.bottom());
-            r = egui::Rect::from_min_max(
+            offset += h;
+            egui::Rect::from_min_max(
                 egui::pos2(rect.left(), y1),
                 egui::pos2(rect.right(), y2),
-            );
-            offset += h;
-        }
+            )
+        };
+
 
         if r.width() < 2.0 || r.height() < 2.0 {
             continue;
@@ -820,7 +950,6 @@ fn layout_treemap_rect(
         };
         painter.rect_stroke(r, 1.0, stroke);
 
-        // Label si suffisamment de place
         if r.width() > 60.0 && r.height() > 30.0 {
             let percent =
                 (node.size as f64 / total_size as f64) * 100.0;
@@ -844,9 +973,9 @@ fn layout_treemap_rect(
             path: node.path.clone(),
             name: node.name.clone(),
             size: node.size,
+            is_dir: node.is_dir,
         });
 
-        // Descente récursive limitée en profondeur
         if !node.children.is_empty() && depth < 3 {
             let child_total = node
                 .children
@@ -875,9 +1004,9 @@ fn color_for_path(path: &Path, depth: usize) -> egui::Color32 {
     depth.hash(&mut hasher);
     let hash = hasher.finish();
 
-    let h = (hash % 360) as f32 / 360.0; // [0,1]
-    let s = 0.5 + ((hash >> 8) % 50) as f32 / 100.0; // [0.5,1.0]
-    let v = 0.4 + ((hash >> 16) % 60) as f32 / 100.0; // [0.4,1.0]
+    let h = (hash % 360) as f32 / 360.0;
+    let s = 0.5 + ((hash >> 8) % 50) as f32 / 100.0;
+    let v = 0.4 + ((hash >> 16) % 60) as f32 / 100.0;
 
     let hsva = egui::epaint::Hsva::new(
         h,
@@ -968,8 +1097,6 @@ fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
 }
 
 /// Construit un Node (fichier ou dossier) pour un chemin donné.
-/// Pour les dossiers, on scanne récursivement (en parallèle pour les sous-éléments),
-/// en vérifiant régulièrement le flag d'annulation.
 fn build_node(path: &Path, cancel: &AtomicBool) -> Result<Node, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Annulé".to_string());
@@ -993,8 +1120,6 @@ fn build_node(path: &Path, cancel: &AtomicBool) -> Result<Node, String> {
             for entry in read_dir.flatten() {
                 entries.push(entry.path());
             }
-        } else {
-            // On ignore les dossiers illisibles sans faire planter l'app
         }
 
         let children: Vec<Node> = entries
@@ -1021,6 +1146,71 @@ fn delete_path(path: &Path) -> std::io::Result<()> {
     } else {
         fs::remove_file(path)
     }
+}
+
+/// Copie/déplacement de fichier ou dossier dans un dossier cible.
+fn copy_or_move(src: &Path, dest_dir: &Path, is_cut: bool) -> Result<(), String> {
+    if !dest_dir.exists() || !dest_dir.is_dir() {
+        return Err(format!(
+            "Destination invalide : {}",
+            dest_dir.to_string_lossy()
+        ));
+    }
+    if !src.exists() {
+        return Err(format!(
+            "Source introuvable : {}",
+            src.to_string_lossy()
+        ));
+    }
+
+    if is_cut && dest_dir.starts_with(src) {
+        return Err("Impossible de déplacer un dossier dans lui-même ou un sous-dossier.".to_string());
+    }
+
+    let file_name = src
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("unnamed"));
+    let dest_path = dest_dir.join(file_name);
+
+    if is_cut {
+        match fs::rename(src, &dest_path) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                // cross-device, fallback copy + delete
+            }
+        }
+    }
+
+    let metadata = fs::symlink_metadata(src).map_err(|e| e.to_string())?;
+    if metadata.is_dir() {
+        copy_dir_recursive(src, &dest_path).map_err(|e| e.to_string())?;
+    } else {
+        fs::copy(src, &dest_path).map_err(|e| e.to_string())?;
+    }
+
+    if is_cut {
+        delete_path(src).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Copie récursive de dossier.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        let dest_path = dest.join(entry.file_name());
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry_path, &dest_path)?;
+        } else {
+            let _ = fs::copy(&entry_path, &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Recherche d'un Node par chemin.
