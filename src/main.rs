@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -105,6 +106,9 @@ struct TreeSizeApp {
     // UI / sélection
     view_mode: ViewMode,
     selected_node_path: Option<PathBuf>,
+
+    // Suppression
+    pending_delete: Option<PathBuf>,
 }
 
 impl Default for TreeSizeApp {
@@ -124,6 +128,7 @@ impl Default for TreeSizeApp {
             scan_mode: ScanMode::Folder,
             view_mode: ViewMode::Tree,
             selected_node_path: None,
+            pending_delete: None,
         }
     }
 }
@@ -311,6 +316,10 @@ impl eframe::App for TreeSizeApp {
                     ui.monospace(node.path.to_string_lossy());
                     ui.label(format!("Taille : {}", format_bytes(node.size)));
                     ui.label(format!("Fichiers : {}", node.file_count));
+                    ui.add_space(8.0);
+                    if ui.button("Supprimer cet élément…").clicked() {
+                        self.pending_delete = Some(node.path.clone());
+                    }
                 } else {
                     ui.weak("Aucun élément sélectionné.");
                 }
@@ -320,12 +329,10 @@ impl eframe::App for TreeSizeApp {
 
                 ui.heading("Infos");
                 ui.small(
-                    "• Les erreurs d'accès (permissions, fichiers spéciaux...) \
-                     sont ignorées sans faire planter l'application.\n\
-                     • L'arrêt du scan est coopératif : le scan se termine dès \
-                     que possible.\n\
-                     • Dans la treemap, clique sur un bloc pour sélectionner \
-                     un dossier/fichier.",
+                    "• Clic gauche sur un élément (arbo ou treemap) pour le sélectionner.\n\
+                     • Clic droit pour le menu contextuel (Propriétés / Copier chemin / Supprimer…).\n\
+                     • Les erreurs d'accès (permissions, fichiers spéciaux...) sont ignorées.\n\
+                     • L'arrêt du scan est coopératif.",
                 );
             });
 
@@ -371,6 +378,8 @@ impl eframe::App for TreeSizeApp {
                                     root,
                                     total_size,
                                     0,
+                                    &mut self.selected_node_path,
+                                    &mut self.pending_delete,
                                 );
                             });
                     }
@@ -382,7 +391,12 @@ impl eframe::App for TreeSizeApp {
                         );
                         ui.add_space(8.0);
 
-                        draw_treemap(ui, root, &mut self.selected_node_path);
+                        draw_treemap(
+                            ui,
+                            root,
+                            &mut self.selected_node_path,
+                            &mut self.pending_delete,
+                        );
                     }
                 }
             } else {
@@ -393,6 +407,65 @@ impl eframe::App for TreeSizeApp {
                 });
             }
         });
+
+        // Fenêtre de confirmation de suppression
+        if let Some(path) = self.pending_delete.clone() {
+            egui::Window::new("Confirmer la suppression")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("Es-tu sûr de vouloir supprimer :");
+                    ui.monospace(path.to_string_lossy());
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "Attention : la suppression est définitive.",
+                    );
+                    ui.add_space(12.0);
+
+                    let mut close = false;
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Annuler").clicked() {
+                            self.pending_delete = None;
+                            close = true;
+                        }
+                        if ui
+                            .button(egui::RichText::new("Supprimer")
+                                .color(egui::Color32::RED))
+                            .clicked()
+                        {
+                            match delete_path(&path) {
+                                Ok(()) => {
+                                    self.status = format!(
+                                        "Supprimé : {}",
+                                        path.to_string_lossy()
+                                    );
+                                    // On recalcule l'arbo si possible
+                                    if let Some(root) =
+                                        self.root_path.clone()
+                                    {
+                                        self.start_scan(root);
+                                    }
+                                }
+                                Err(e) => {
+                                    self.status = format!(
+                                        "Erreur suppression : {}",
+                                        e
+                                    );
+                                }
+                            }
+                            self.pending_delete = None;
+                            close = true;
+                        }
+                    });
+
+                    if close {
+                        // la fenêtre disparaîtra au prochain frame car pending_delete = None
+                    }
+                });
+        }
     }
 }
 
@@ -405,6 +478,7 @@ impl TreeSizeApp {
         );
         self.root_node = None;
         self.selected_node_path = None;
+        self.pending_delete = None;
 
         let (tx, rx) = unbounded::<ScanResult>();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -426,12 +500,14 @@ impl TreeSizeApp {
     }
 }
 
-/// Dessin récursif d'un Node en arbre (vue arborescence).
+/// Dessin récursif d'un Node en arbre (vue arborescence) + clic gauche/droit.
 fn draw_node_recursive(
     ui: &mut egui::Ui,
     node: &Node,
     root_size: u64,
     indent_level: usize,
+    selected_node_path: &mut Option<PathBuf>,
+    pending_delete: &mut Option<PathBuf>,
 ) {
     let indent = 18.0 * indent_level as f32;
     let percentage = if root_size > 0 {
@@ -462,18 +538,83 @@ fn draw_node_recursive(
             .default_open(indent_level == 0)
             .id_source(node.path.to_string_lossy().to_string());
 
-        header.show(ui, |ui| {
+        let collapsing = header.show(ui, |ui| {
             for child in &node.children {
                 ui.horizontal(|ui| {
                     ui.add_space(indent + 10.0);
-                    draw_node_recursive(ui, child, root_size, indent_level + 1);
+                    draw_node_recursive(
+                        ui,
+                        child,
+                        root_size,
+                        indent_level + 1,
+                        selected_node_path,
+                        pending_delete,
+                    );
                 });
             }
         });
+
+        let header_resp = collapsing.header_response;
+
+        // Clic gauche => sélection
+        if header_resp.clicked() {
+            *selected_node_path = Some(node.path.clone());
+        }
+
+        // Clic droit => menu contextuel
+        header_resp.context_menu(|ui| {
+            if ui.button("Propriétés").clicked() {
+                *selected_node_path = Some(node.path.clone());
+                ui.close_menu();
+            }
+            if ui.button("Copier le chemin").clicked() {
+                let text = node.path.to_string_lossy().to_string();
+                ui.output_mut(|o| o.copied_text = text);
+                ui.close_menu();
+            }
+            if ui
+                .button(
+                    egui::RichText::new("Supprimer…")
+                        .color(egui::Color32::RED),
+                )
+                .clicked()
+            {
+                *pending_delete = Some(node.path.clone());
+                ui.close_menu();
+            }
+        });
     } else {
-        ui.horizontal(|ui| {
-            ui.add_space(indent + 10.0);
-            ui.label(label);
+        let resp = ui
+            .horizontal(|ui| {
+                ui.add_space(indent + 10.0);
+                ui.label(label);
+            })
+            .response;
+
+        if resp.clicked() {
+            *selected_node_path = Some(node.path.clone());
+        }
+
+        resp.context_menu(|ui| {
+            if ui.button("Propriétés").clicked() {
+                *selected_node_path = Some(node.path.clone());
+                ui.close_menu();
+            }
+            if ui.button("Copier le chemin").clicked() {
+                let text = node.path.to_string_lossy().to_string();
+                ui.output_mut(|o| o.copied_text = text);
+                ui.close_menu();
+            }
+            if ui
+                .button(
+                    egui::RichText::new("Supprimer…")
+                        .color(egui::Color32::RED),
+                )
+                .clicked()
+            {
+                *pending_delete = Some(node.path.clone());
+                ui.close_menu();
+            }
         });
     }
 }
@@ -486,11 +627,12 @@ struct Hit {
     size: u64,
 }
 
-/// Dessin de la treemap façon WinDirStat.
+/// Dessin de la treemap façon WinDirStat + clic gauche/droit.
 fn draw_treemap(
     ui: &mut egui::Ui,
     root: &Node,
     selected_path: &mut Option<PathBuf>,
+    pending_delete: &mut Option<PathBuf>,
 ) {
     let total_size = root.size.max(1);
 
@@ -525,7 +667,7 @@ fn draw_treemap(
     );
 
     if let Some(pos) = response.interact_pointer_pos() {
-        // Sélection au clic
+        // Clic gauche => sélection
         if response.clicked() {
             for hit in &hits {
                 if hit.rect.contains(pos) {
@@ -559,6 +701,44 @@ fn draw_treemap(
             }
         }
     }
+
+    // Menu contextuel (clic droit) sur la zone treemap
+    response.context_menu(|ui| {
+        if let Some(pos) = ui.ctx().pointer_latest_pos() {
+            if let Some(hit) =
+                hits.iter().find(|h| h.rect.contains(pos))
+            {
+                ui.label(hit.name.clone());
+                ui.monospace(hit.path.to_string_lossy());
+                ui.separator();
+
+                if ui.button("Propriétés").clicked() {
+                    *selected_path = Some(hit.path.clone());
+                    ui.close_menu();
+                }
+                if ui.button("Copier le chemin").clicked() {
+                    let text =
+                        hit.path.to_string_lossy().to_string();
+                    ui.output_mut(|o| o.copied_text = text);
+                    ui.close_menu();
+                }
+                if ui
+                    .button(
+                        egui::RichText::new("Supprimer…")
+                            .color(egui::Color32::RED),
+                    )
+                    .clicked()
+                {
+                    *pending_delete = Some(hit.path.clone());
+                    ui.close_menu();
+                }
+            } else {
+                ui.weak("Aucun élément ici.");
+            }
+        } else {
+            ui.weak("Aucun pointeur.");
+        }
+    });
 }
 
 /// Algorithme de treemap simple (slice-and-dice) avec alternance horizontal/vertical.
@@ -830,6 +1010,16 @@ fn build_node(path: &Path, cancel: &AtomicBool) -> Result<Node, String> {
         Ok(Node::new_dir(name, path.to_path_buf(), children))
     } else {
         Err("Type de fichier non pris en charge".to_string())
+    }
+}
+
+/// Suppression d'un fichier ou dossier (récursif pour les dossiers).
+fn delete_path(path: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
