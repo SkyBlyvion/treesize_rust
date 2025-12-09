@@ -1,11 +1,11 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
+use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver};
 use eframe::{egui, NativeOptions};
@@ -83,6 +83,12 @@ enum ScanMode {
     Drive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Tree,
+    Treemap,
+}
+
 struct TreeSizeApp {
     root_path: Option<PathBuf>,
     root_node: Option<Node>,
@@ -91,10 +97,14 @@ struct TreeSizeApp {
     scan_receiver: Option<Receiver<ScanResult>>,
     cancel_flag: Option<Arc<AtomicBool>>,
 
-    // UI
+    // Scan options
     available_roots: Vec<PathBuf>,
     selected_root_index: usize,
     scan_mode: ScanMode,
+
+    // UI / sélection
+    view_mode: ViewMode,
+    selected_node_path: Option<PathBuf>,
 }
 
 impl Default for TreeSizeApp {
@@ -112,6 +122,8 @@ impl Default for TreeSizeApp {
             available_roots: roots,
             selected_root_index: 0,
             scan_mode: ScanMode::Folder,
+            view_mode: ViewMode::Tree,
+            selected_node_path: None,
         }
     }
 }
@@ -276,12 +288,44 @@ impl eframe::App for TreeSizeApp {
                 ui.add_space(12.0);
                 ui.separator();
 
+                ui.heading("Vue");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.view_mode,
+                        ViewMode::Tree,
+                        "Arborescence",
+                    );
+                    ui.selectable_value(
+                        &mut self.view_mode,
+                        ViewMode::Treemap,
+                        "Treemap",
+                    );
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+
+                ui.heading("Sélection");
+                if let Some(node) = self.get_selected_node() {
+                    ui.label(format!("Nom : {}", node.name));
+                    ui.monospace(node.path.to_string_lossy());
+                    ui.label(format!("Taille : {}", format_bytes(node.size)));
+                    ui.label(format!("Fichiers : {}", node.file_count));
+                } else {
+                    ui.weak("Aucun élément sélectionné.");
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+
                 ui.heading("Infos");
                 ui.small(
                     "• Les erreurs d'accès (permissions, fichiers spéciaux...) \
                      sont ignorées sans faire planter l'application.\n\
                      • L'arrêt du scan est coopératif : le scan se termine dès \
-                     que possible.",
+                     que possible.\n\
+                     • Dans la treemap, clique sur un bloc pour sélectionner \
+                     un dossier/fichier.",
                 );
             });
 
@@ -313,15 +357,34 @@ impl eframe::App for TreeSizeApp {
 
                 ui.add_space(12.0);
                 ui.separator();
-                ui.heading("Arborescence (triée par taille)");
 
-                ui.add_space(8.0);
+                match self.view_mode {
+                    ViewMode::Tree => {
+                        ui.heading("Arborescence (triée par taille)");
+                        ui.add_space(8.0);
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        draw_node_recursive(ui, root, total_size, 0);
-                    });
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                draw_node_recursive(
+                                    ui,
+                                    root,
+                                    total_size,
+                                    0,
+                                );
+                            });
+                    }
+                    ViewMode::Treemap => {
+                        ui.heading("Treemap façon WinDirStat");
+                        ui.small(
+                            "Chaque bloc représente un dossier/fichier, \
+                             proportionnel à sa taille.",
+                        );
+                        ui.add_space(8.0);
+
+                        draw_treemap(ui, root, &mut self.selected_node_path);
+                    }
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label(
@@ -341,6 +404,7 @@ impl TreeSizeApp {
             path.to_string_lossy()
         );
         self.root_node = None;
+        self.selected_node_path = None;
 
         let (tx, rx) = unbounded::<ScanResult>();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -354,9 +418,15 @@ impl TreeSizeApp {
             let _ = tx.send(result);
         });
     }
+
+    fn get_selected_node(&self) -> Option<&Node> {
+        let root = self.root_node.as_ref()?;
+        let path = self.selected_node_path.as_ref()?;
+        find_node_by_path(root, path)
+    }
 }
 
-/// Dessin récursif d'un Node en arbre.
+/// Dessin récursif d'un Node en arbre (vue arborescence).
 fn draw_node_recursive(
     ui: &mut egui::Ui,
     node: &Node,
@@ -406,6 +476,236 @@ fn draw_node_recursive(
             ui.label(label);
         });
     }
+}
+
+/// Un bloc cliquable dans la treemap.
+struct Hit {
+    rect: egui::Rect,
+    path: PathBuf,
+    name: String,
+    size: u64,
+}
+
+/// Dessin de la treemap façon WinDirStat.
+fn draw_treemap(
+    ui: &mut egui::Ui,
+    root: &Node,
+    selected_path: &mut Option<PathBuf>,
+) {
+    let total_size = root.size.max(1);
+
+    let available_size = ui.available_size();
+    let size = egui::vec2(
+        available_size.x.max(200.0),
+        available_size.y.max(200.0),
+    );
+
+    let (response, painter) =
+        ui.allocate_painter(size, egui::Sense::click());
+    let rect = response.rect;
+
+    let children = &root.children;
+    let sum_children_size = children
+        .iter()
+        .map(|c| c.size)
+        .sum::<u64>()
+        .max(1);
+
+    let mut hits: Vec<Hit> = Vec::new();
+
+    layout_treemap_rect(
+        &painter,
+        rect,
+        true,
+        children,
+        sum_children_size,
+        selected_path,
+        &mut hits,
+        0,
+    );
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        // Sélection au clic
+        if response.clicked() {
+            for hit in &hits {
+                if hit.rect.contains(pos) {
+                    *selected_path = Some(hit.path.clone());
+                    break;
+                }
+            }
+        }
+
+        // Tooltip au survol
+        for hit in &hits {
+            if hit.rect.contains(pos) {
+                let percent =
+                    (hit.size as f64 / total_size as f64) * 100.0;
+                let text = format!(
+                    "{}\n{}\n{} ({:.2}%)",
+                    hit.name,
+                    hit.path.display(),
+                    format_bytes(hit.size),
+                    percent
+                );
+
+                egui::show_tooltip_at_pointer(
+                    ui.ctx(),
+                    egui::Id::new("treemap_tooltip"),
+                    |ui| {
+                        ui.label(text);
+                    },
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Algorithme de treemap simple (slice-and-dice) avec alternance horizontal/vertical.
+fn layout_treemap_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    horizontal: bool,
+    nodes: &[Node],
+    total_size: u64,
+    selected_path: &Option<PathBuf>,
+    hits: &mut Vec<Hit>,
+    depth: usize,
+) {
+    if nodes.is_empty() || rect.width() <= 2.0 || rect.height() <= 2.0 {
+        return;
+    }
+
+    let mut offset = if horizontal { rect.left() } else { rect.top() };
+    let total_size_f = total_size as f32;
+
+    for node in nodes {
+        if node.size == 0 {
+            continue;
+        }
+
+        let fraction = node.size as f32 / total_size_f;
+        if fraction <= 0.0 {
+            continue;
+        }
+
+        let mut r = rect;
+        if horizontal {
+            let w = rect.width() * fraction;
+            let x1 = offset;
+            let x2 = (offset + w).min(rect.right());
+            r = egui::Rect::from_min_max(
+                egui::pos2(x1, rect.top()),
+                egui::pos2(x2, rect.bottom()),
+            );
+            offset += w;
+        } else {
+            let h = rect.height() * fraction;
+            let y1 = offset;
+            let y2 = (offset + h).min(rect.bottom());
+            r = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), y1),
+                egui::pos2(rect.right(), y2),
+            );
+            offset += h;
+        }
+
+        if r.width() < 2.0 || r.height() < 2.0 {
+            continue;
+        }
+
+        let is_selected = selected_path
+            .as_ref()
+            .map_or(false, |p| p == &node.path);
+
+        let base_color = color_for_path(&node.path, depth);
+        let fill_color = if is_selected {
+            base_color.gamma_multiply(0.8)
+        } else {
+            base_color
+        };
+
+        painter.rect_filled(r, 1.0, fill_color);
+
+        let stroke = if is_selected {
+            egui::Stroke {
+                width: 2.0,
+                color: egui::Color32::WHITE,
+            }
+        } else {
+            egui::Stroke {
+                width: 0.5,
+                color: egui::Color32::from_gray(40),
+            }
+        };
+        painter.rect_stroke(r, 1.0, stroke);
+
+        // Label si suffisamment de place
+        if r.width() > 60.0 && r.height() > 30.0 {
+            let percent =
+                (node.size as f64 / total_size as f64) * 100.0;
+            let text = format!(
+                "{}\n{} ({:.1}%)",
+                node.name,
+                format_bytes(node.size),
+                percent
+            );
+            painter.text(
+                r.left_top() + egui::vec2(3.0, 3.0),
+                egui::Align2::LEFT_TOP,
+                text,
+                egui::FontId::proportional(10.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        hits.push(Hit {
+            rect: r,
+            path: node.path.clone(),
+            name: node.name.clone(),
+            size: node.size,
+        });
+
+        // Descente récursive limitée en profondeur
+        if !node.children.is_empty() && depth < 3 {
+            let child_total = node
+                .children
+                .iter()
+                .map(|c| c.size)
+                .sum::<u64>()
+                .max(1);
+            layout_treemap_rect(
+                painter,
+                r.shrink(1.0),
+                !horizontal,
+                &node.children,
+                child_total,
+                selected_path,
+                hits,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Coloration déterministe en fonction du chemin (pour la treemap).
+fn color_for_path(path: &Path, depth: usize) -> egui::Color32 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    depth.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let h = (hash % 360) as f32 / 360.0; // [0,1]
+    let s = 0.5 + ((hash >> 8) % 50) as f32 / 100.0; // [0.5,1.0]
+    let v = 0.4 + ((hash >> 16) % 60) as f32 / 100.0; // [0.4,1.0]
+
+    let hsva = egui::epaint::Hsva::new(
+        h,
+        s.min(1.0),
+        v.min(1.0),
+        1.0,
+    );
+    hsva.into()
 }
 
 /// Utilise une boîte de dialogue native pour choisir un dossier.
@@ -531,6 +831,19 @@ fn build_node(path: &Path, cancel: &AtomicBool) -> Result<Node, String> {
     } else {
         Err("Type de fichier non pris en charge".to_string())
     }
+}
+
+/// Recherche d'un Node par chemin.
+fn find_node_by_path<'a>(node: &'a Node, path: &Path) -> Option<&'a Node> {
+    if node.path == path {
+        return Some(node);
+    }
+    for child in &node.children {
+        if let Some(found) = find_node_by_path(child, path) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Format taille en bytes en Ko/Mo/Go lisible.
