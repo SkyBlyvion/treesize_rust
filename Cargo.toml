@@ -1,0 +1,17 @@
+[package]
+name = "treesize_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# UI native cross-platform
+eframe = { version = "0.27", features = ["default"] }
+
+# Parallélisation du scan
+rayon = "1.10"
+
+# Boîte de dialogue native "ouvrir dossier"
+rfd = "0.14"
+
+# Pour les threads & canaux
+crossbeam-channel = "0.5"
