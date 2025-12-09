@@ -23,7 +23,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "TreeSize Rust (Windows / Linux)",
         native_options,
-        Box::new(|_cc| Box::new(TreeSizeApp::default())),
+        Box::new(|cc| Box::new(TreeSizeApp::new(cc))),
     )
 }
 
@@ -142,317 +142,417 @@ impl Default for TreeSizeApp {
     }
 }
 
-impl eframe::App for TreeSizeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Récupère le résultat du scan si disponible
-        if self.is_scanning {
-            if let Some(rx) = &self.scan_receiver {
-                if let Ok(result) = rx.try_recv() {
-                    self.is_scanning = false;
-                    self.scan_receiver = None;
-                    self.cancel_flag = None;
+impl TreeSizeApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Style global + thème dark un peu modernisé
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.visuals = egui::Visuals::dark();
 
-                    if let Some(err) = result.error {
-                        self.root_node = None;
-                        self.status = err;
-                    } else {
-                        self.root_node = result.root_node;
-                        self.status = format!(
-                            "Scan terminé pour : {}",
-                            result.root_path.to_string_lossy()
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.window_margin = egui::Margin::symmetric(10.0, 8.0);
+
+        style.visuals.window_rounding = 6.0.into();
+        style.visuals.menu_rounding = 6.0.into();
+        style.visuals.widgets.inactive.rounding = 4.0.into();
+        style.visuals.widgets.hovered.rounding = 4.0.into();
+        style.visuals.widgets.active.rounding = 4.0.into();
+
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(20.0),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::proportional(14.0),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(13.0),
+        );
+
+        cc.egui_ctx.set_style(style);
+        cc.egui_ctx.set_pixels_per_point(1.05);
+
+        Self::default()
+    }
+
+    fn draw_top_bar(&self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(60.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("TreeSize Rust");
+                    ui.separator();
+
+                    if let Some(path) = &self.root_path {
+                        ui.label(
+                            egui::RichText::new(path.to_string_lossy())
+                                .monospace()
+                                .weak(),
                         );
+                    } else {
+                        ui.weak("Aucun dossier / lecteur sélectionné");
                     }
 
-                    ctx.request_repaint();
-                }
-            }
-        }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if self.is_scanning {
+                                ui.spinner();
+                                ui.label("Scan en cours…");
+                            } else {
+                                ui.label("Prêt");
+                            }
+                        },
+                    );
+                });
 
-        // Panneau de configuration (gauche)
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+    }
+
+    fn draw_left_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("left_panel")
             .resizable(true)
-            .default_width(320.0)
+            .default_width(340.0)
             .show(ctx, |ui| {
-                ui.heading("Options de scan");
-                ui.separator();
-
-                ui.label("Mode de scan :");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.scan_mode,
-                        ScanMode::Folder,
-                        "Dossier",
-                    );
-                    ui.selectable_value(
-                        &mut self.scan_mode,
-                        ScanMode::Drive,
-                        "Lecteur",
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("Analyseur d’occupation disque")
+                            .small()
+                            .italics()
+                            .weak(),
                     );
                 });
 
                 ui.add_space(8.0);
 
-                match self.scan_mode {
-                    ScanMode::Folder => {
-                        ui.label("Dossier sélectionné :");
-                        if let Some(path) = &self.root_path {
-                            ui.monospace(path.to_string_lossy());
-                        } else {
-                            ui.weak("(aucun dossier sélectionné)");
-                        }
+                section_card(ui, "Mode de scan", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(
+                            &mut self.scan_mode,
+                            ScanMode::Folder,
+                            "Dossier",
+                        );
+                        ui.selectable_value(
+                            &mut self.scan_mode,
+                            ScanMode::Drive,
+                            "Lecteur",
+                        );
+                    });
 
-                        if ui
-                            .add_enabled(
-                                !self.is_scanning,
-                                egui::Button::new("Choisir un dossier…"),
+                    ui.add_space(6.0);
+
+                    match self.scan_mode {
+                        ScanMode::Folder => {
+                            ui.label("Dossier sélectionné :");
+                            if let Some(path) = &self.root_path {
+                                ui.monospace(path.to_string_lossy());
+                            } else {
+                                ui.weak("(aucun dossier sélectionné)");
+                            }
+
+                            ui.add_space(4.0);
+
+                            let choose_btn = egui::Button::new(
+                                "Choisir un dossier…",
                             )
-                            .clicked()
-                        {
-                            if let Some(path) = pick_directory() {
-                                self.root_path = Some(path.clone());
-                                self.status = format!(
-                                    "Dossier sélectionné : {}",
-                                    path.to_string_lossy()
-                                );
+                            .fill(
+                                ui.visuals().widgets.inactive.bg_fill,
+                            );
+
+                            if ui
+                                .add_enabled(!self.is_scanning, choose_btn)
+                                .clicked()
+                            {
+                                if let Some(path) = pick_directory() {
+                                    self.root_path = Some(path.clone());
+                                    self.status = format!(
+                                        "Dossier sélectionné : {}",
+                                        path.to_string_lossy()
+                                    );
+                                }
                             }
                         }
-                    }
-                    ScanMode::Drive => {
-                        ui.label("Lecteur / racine à scanner :");
-                        if self.available_roots.is_empty() {
-                            ui.weak("Aucun lecteur détecté.");
-                        } else {
-                            let current_index = self.selected_root_index.min(
-                                self.available_roots.len().saturating_sub(1),
-                            );
-                            self.selected_root_index = current_index;
+                        ScanMode::Drive => {
+                            ui.label("Lecteur / racine à scanner :");
+                            if self.available_roots.is_empty() {
+                                ui.weak("Aucun lecteur détecté.");
+                            } else {
+                                let current_index =
+                                    self.selected_root_index.min(
+                                        self.available_roots.len()
+                                            .saturating_sub(1),
+                                    );
+                                self.selected_root_index =
+                                    current_index;
 
-                            let current_root =
-                                &self.available_roots[self.selected_root_index];
+                                let current_root = &self.available_roots
+                                    [self.selected_root_index];
 
-                            egui::ComboBox::from_label("Choisir un lecteur")
-                                .selected_text(current_root.to_string_lossy())
+                                egui::ComboBox::from_label(
+                                    "Choisir un lecteur",
+                                )
+                                .selected_text(
+                                    current_root.to_string_lossy(),
+                                )
                                 .show_ui(ui, |ui| {
-                                    for (i, root) in
-                                        self.available_roots.iter().enumerate()
+                                    for (i, root) in self
+                                        .available_roots
+                                        .iter()
+                                        .enumerate()
                                     {
-                                        let label =
-                                            root.to_string_lossy().to_string();
+                                        let label = root
+                                            .to_string_lossy()
+                                            .to_string();
                                         ui.selectable_value(
-                                            &mut self.selected_root_index,
+                                            &mut self
+                                                .selected_root_index,
                                             i,
                                             label,
                                         );
                                     }
                                 });
 
-                            self.root_path =
-                                Some(current_root.to_path_buf());
-                        }
-                    }
-                }
-
-                ui.add_space(16.0);
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    let can_scan =
-                        !self.is_scanning && self.root_path.is_some();
-                    if ui
-                        .add_enabled(can_scan, egui::Button::new("Lancer le scan"))
-                        .clicked()
-                    {
-                        if let Some(path) = self.root_path.clone() {
-                            self.start_scan(path);
-                        } else {
-                            self.status =
-                                "Aucun dossier / lecteur sélectionné".to_string();
-                        }
-                    }
-
-                    let can_stop = self.is_scanning
-                        && self.cancel_flag.is_some();
-                    if ui
-                        .add_enabled(
-                            can_stop,
-                            egui::Button::new("Arrêter le scan"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(flag) = &self.cancel_flag {
-                            flag.store(true, Ordering::Relaxed);
-                            self.status =
-                                "Arrêt du scan demandé, patiente..."
-                                    .to_string();
+                                self.root_path =
+                                    Some(current_root.to_path_buf());
+                            }
                         }
                     }
                 });
 
-                ui.add_space(8.0);
-                ui.separator();
-
-                ui.label("Statut :");
-                if self.is_scanning {
+                section_card(ui, "Actions", |ui| {
                     ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(&self.status);
+                        let can_scan =
+                            !self.is_scanning && self.root_path.is_some();
+                        if ui
+                            .add_enabled(
+                                can_scan,
+                                egui::Button::new("Lancer le scan")
+                                    .fill(
+                                        ui.visuals()
+                                            .selection
+                                            .bg_fill,
+                                    ),
+                            )
+                            .clicked()
+                        {
+                            if let Some(path) =
+                                self.root_path.clone()
+                            {
+                                self.start_scan(path);
+                            } else {
+                                self.status = "Aucun dossier / lecteur sélectionné"
+                                    .to_string();
+                            }
+                        }
+
+                        let can_stop =
+                            self.is_scanning && self.cancel_flag.is_some();
+                        if ui
+                            .add_enabled(
+                                can_stop,
+                                egui::Button::new("Arrêter")
+                                    .fill(
+                                        egui::Color32::from_rgb(
+                                            120, 40, 40,
+                                        ),
+                                    ),
+                            )
+                            .clicked()
+                        {
+                            if let Some(flag) = &self.cancel_flag {
+                                flag.store(true, Ordering::Relaxed);
+                                self.status = "Arrêt du scan demandé…"
+                                    .to_string();
+                            }
+                        }
                     });
-                } else {
-                    ui.label(&self.status);
-                }
-
-                ui.add_space(12.0);
-                ui.separator();
-
-                ui.heading("Vue");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.view_mode,
-                        ViewMode::Tree,
-                        "Arborescence",
-                    );
-                    ui.selectable_value(
-                        &mut self.view_mode,
-                        ViewMode::Treemap,
-                        "Treemap",
-                    );
                 });
 
-                ui.add_space(12.0);
-                ui.separator();
+                section_card(ui, "Vue", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.view_mode,
+                            ViewMode::Tree,
+                            "Arborescence",
+                        );
+                        ui.selectable_value(
+                            &mut self.view_mode,
+                            ViewMode::Treemap,
+                            "Treemap",
+                        );
+                    });
+                });
 
-                ui.heading("Sélection");
-                if let Some(node) = self.get_selected_node() {
-                    ui.label(format!("Nom : {}", node.name));
-                    ui.monospace(node.path.to_string_lossy());
-                    ui.label(format!("Taille : {}", format_bytes(node.size)));
-                    ui.label(format!("Fichiers : {}", node.file_count));
-                    ui.add_space(8.0);
-                    if ui.button("Supprimer cet élément…").clicked() {
-                        self.pending_delete = Some(node.path.clone());
+                section_card(ui, "Élément sélectionné", |ui| {
+                    if let Some(node) = self.get_selected_node() {
+                        ui.label(format!("Nom : {}", node.name));
+                        ui.monospace(node.path.to_string_lossy());
+                        ui.label(format!(
+                            "Taille : {}",
+                            format_bytes(node.size)
+                        ));
+                        ui.label(format!(
+                            "Fichiers : {}",
+                            node.file_count
+                        ));
+                        ui.add_space(6.0);
+                        if ui
+                            .button(
+                                egui::RichText::new(
+                                    "Supprimer cet élément…",
+                                )
+                                .color(egui::Color32::RED),
+                            )
+                            .clicked()
+                        {
+                            self.pending_delete =
+                                Some(node.path.clone());
+                        }
+                    } else {
+                        ui.weak("Aucun élément sélectionné.");
                     }
-                } else {
-                    ui.weak("Aucun élément sélectionné.");
-                }
+                });
 
-                ui.add_space(8.0);
-                ui.separator();
-
-                ui.heading("Presse-papier (fichiers/dossiers)");
-                match &self.clipboard_path {
-                    Some(p) => {
-                        ui.label(if self.clipboard_is_cut {
-                            "Mode : Couper"
-                        } else {
-                            "Mode : Copier"
-                        });
-                        ui.monospace(p.to_string_lossy());
-                        if ui.button("Vider le presse-papier").clicked() {
-                            self.clipboard_path = None;
-                            self.clipboard_is_cut = false;
+                section_card(ui, "Presse-papier (fichiers/dossiers)", |ui| {
+                    match &self.clipboard_path {
+                        Some(p) => {
+                            ui.label(if self.clipboard_is_cut {
+                                "Mode : Couper"
+                            } else {
+                                "Mode : Copier"
+                            });
+                            ui.monospace(p.to_string_lossy());
+                            ui.add_space(4.0);
+                            if ui
+                                .button("Vider le presse-papier")
+                                .clicked()
+                            {
+                                self.clipboard_path = None;
+                                self.clipboard_is_cut = false;
+                            }
+                        }
+                        None => {
+                            ui.weak("Presse-papier vide.");
                         }
                     }
-                    None => {
-                        ui.weak("Presse-papier vide.");
-                    }
-                }
+                });
 
-                ui.add_space(12.0);
-                ui.separator();
-
-                ui.heading("Infos");
-                ui.small(
-                    "• Clic gauche sur un élément (arbo ou treemap) pour le sélectionner.\n\
-                     • Clic droit pour le menu contextuel (Propriétés / Copier chemin / Copier / Couper / Supprimer / Coller ici).\n\
-                     • Les erreurs d'accès (permissions, fichiers spéciaux...) sont ignorées.\n\
-                     • L'arrêt du scan est coopératif.",
-                );
+                section_card(ui, "Aide rapide", |ui| {
+                    ui.small(
+                        "• Clic gauche : sélection dans l’arborescence ou la treemap.\n\
+                         • Clic droit : menu contextuel (Propriétés, Copier chemin, Copier/Couper, Supprimer, Coller ici).\n\
+                         • Les erreurs d’accès (permissions, fichiers spéciaux…) sont ignorées.\n\
+                         • L’arrêt du scan est coopératif : les threads finissent proprement.",
+                    );
+                });
             });
+    }
 
-        // Panneau principal (résultats)
+    fn draw_central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(root) = &self.root_node {
                 let total_size = root.size;
                 let total_files = root.file_count;
 
-                ui.heading("Résultats du scan");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Racine : {}",
-                        root.path.to_string_lossy()
-                    ));
+                section_card(ui, "Résultats du scan", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Racine :");
+                        ui.monospace(root.path.to_string_lossy());
+                    });
+
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Taille totale : {}",
+                            format_bytes(total_size)
+                        ));
+                        ui.separator();
+                        ui.label(format!(
+                            "Nombre de fichiers : {}",
+                            total_files
+                        ));
+                    });
                 });
 
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Taille totale : {}",
-                        format_bytes(total_size)
-                    ));
-                    ui.separator();
-                    ui.label(format!("Nombre de fichiers : {}", total_files));
-                });
-
-                ui.add_space(12.0);
-                ui.separator();
+                ui.add_space(4.0);
 
                 match self.view_mode {
                     ViewMode::Tree => {
-                        ui.heading("Arborescence (triée par taille)");
-                        ui.add_space(8.0);
-
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                draw_node_recursive(
-                                    ui,
-                                    root,
-                                    total_size,
-                                    0,
-                                    &mut self.selected_node_path,
-                                    &mut self.pending_delete,
-                                    &mut self.clipboard_path,
-                                    &mut self.clipboard_is_cut,
-                                    &mut self.pending_paste_dest,
-                                );
-                            });
+                        section_card(
+                            ui,
+                            "Arborescence (triée par taille)",
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        draw_node_recursive(
+                                            ui,
+                                            root,
+                                            total_size,
+                                            0,
+                                            &mut self
+                                                .selected_node_path,
+                                            &mut self.pending_delete,
+                                            &mut self
+                                                .clipboard_path,
+                                            &mut self
+                                                .clipboard_is_cut,
+                                            &mut self
+                                                .pending_paste_dest,
+                                        );
+                                    });
+                            },
+                        );
                     }
                     ViewMode::Treemap => {
-                        ui.heading("Treemap façon WinDirStat");
-                        ui.small(
-                            "Chaque bloc représente un dossier/fichier, \
-                             proportionnel à sa taille.",
-                        );
-                        ui.add_space(8.0);
+                        section_card(ui, "Treemap façon WinDirStat", |ui| {
+                            ui.small(
+                                "Chaque bloc représente un dossier/fichier, \
+                                 proportionnel à sa taille.",
+                            );
+                            ui.add_space(6.0);
 
-                        draw_treemap(
-                            ui,
-                            root,
-                            &mut self.selected_node_path,
-                            &mut self.pending_delete,
-                            &mut self.clipboard_path,
-                            &mut self.clipboard_is_cut,
-                            &mut self.pending_paste_dest,
-                        );
+                            draw_treemap(
+                                ui,
+                                root,
+                                &mut self.selected_node_path,
+                                &mut self.pending_delete,
+                                &mut self.clipboard_path,
+                                &mut self.clipboard_is_cut,
+                                &mut self.pending_paste_dest,
+                            );
+                        });
                     }
                 }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        "Choisis un dossier ou un lecteur, puis lance un scan.",
+                        "Choisis un dossier ou un lecteur dans le panneau de gauche, puis lance un scan.",
                     );
                 });
             }
         });
+    }
 
-        // Fenêtre de confirmation de suppression
+    fn draw_delete_window(&mut self, ctx: &egui::Context) {
         if let Some(path) = self.pending_delete.clone() {
             egui::Window::new("Confirmer la suppression")
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .anchor(
+                    egui::Align2::CENTER_CENTER,
+                    egui::vec2(0.0, 0.0),
+                )
                 .show(ctx, |ui| {
                     ui.label("Es-tu sûr de vouloir supprimer :");
                     ui.monospace(path.to_string_lossy());
@@ -506,21 +606,12 @@ impl eframe::App for TreeSizeApp {
                     }
                 });
         }
-
-        // Traitement différé du "Coller ici"
-        if let Some(dest) = self.pending_paste_dest.take() {
-            self.handle_paste(&dest);
-        }
     }
-}
 
-impl TreeSizeApp {
     fn start_scan(&mut self, path: PathBuf) {
         self.is_scanning = true;
-        self.status = format!(
-            "Scan en cours pour : {}",
-            path.to_string_lossy()
-        );
+        self.status =
+            format!("Scan en cours pour : {}", path.to_string_lossy());
         self.root_node = None;
         self.selected_node_path = None;
         self.pending_delete = None;
@@ -548,7 +639,8 @@ impl TreeSizeApp {
         let src = match self.clipboard_path.clone() {
             Some(p) => p,
             None => {
-                self.status = "Presse-papier vide, rien à coller.".to_string();
+                self.status =
+                    "Presse-papier vide, rien à coller.".to_string();
                 return;
             }
         };
@@ -576,10 +668,73 @@ impl TreeSizeApp {
                 }
             }
             Err(e) => {
-                self.status = format!("Erreur copie/déplacement : {}", e);
+                self.status =
+                    format!("Erreur copie/déplacement : {}", e);
             }
         }
     }
+}
+
+impl eframe::App for TreeSizeApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.is_scanning {
+            ctx.request_repaint();
+        }
+
+        // Récupère le résultat du scan si disponible
+        if self.is_scanning {
+            if let Some(rx) = &self.scan_receiver {
+                if let Ok(result) = rx.try_recv() {
+                    self.is_scanning = false;
+                    self.scan_receiver = None;
+                    self.cancel_flag = None;
+
+                    if let Some(err) = result.error {
+                        self.root_node = None;
+                        self.status = err;
+                    } else {
+                        self.root_node = result.root_node;
+                        self.status = format!(
+                            "Scan terminé pour : {}",
+                            result.root_path.to_string_lossy()
+                        );
+                    }
+
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        self.draw_top_bar(ctx);
+        self.draw_left_panel(ctx);
+        self.draw_central_panel(ctx);
+        self.draw_delete_window(ctx);
+
+        // Traitement différé du "Coller ici"
+        if let Some(dest) = self.pending_paste_dest.take() {
+            self.handle_paste(&dest);
+        }
+    }
+}
+
+/// Petit helper pour dessiner un panneau type “card”.
+fn section_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    ui.group(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .strong()
+                    .size(15.0),
+            );
+            ui.add_space(4.0);
+            body(ui);
+        });
+    });
+    ui.add_space(6.0);
 }
 
 /// Dessin récursif d'un Node en arbre (vue arborescence) + clic gauche/droit.
@@ -1041,12 +1196,8 @@ fn color_for_path(path: &Path, depth: usize) -> egui::Color32 {
     let s = 0.5 + ((hash >> 8) % 50) as f32 / 100.0;
     let v = 0.4 + ((hash >> 16) % 60) as f32 / 100.0;
 
-    let hsva = egui::epaint::Hsva::new(
-        h,
-        s.min(1.0),
-        v.min(1.0),
-        1.0,
-    );
+    let hsva =
+        egui::epaint::Hsva::new(h, s.min(1.0), v.min(1.0), 1.0);
     hsva.into()
 }
 
@@ -1077,7 +1228,9 @@ fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
         return ScanResult {
             root_path: root.to_path_buf(),
             root_node: None,
-            error: Some("Chemin sélectionné n'est pas un dossier".to_string()),
+            error: Some(
+                "Chemin sélectionné n'est pas un dossier".to_string(),
+            ),
         };
     }
 
@@ -1092,7 +1245,9 @@ fn scan_directory_parallel(root: &Path, cancel: &AtomicBool) -> ScanResult {
             return ScanResult {
                 root_path: root.to_path_buf(),
                 root_node: None,
-                error: Some(format!("Impossible de lire le dossier racine : {e}")),
+                error: Some(format!(
+                    "Impossible de lire le dossier racine : {e}"
+                )),
             };
         }
     }
@@ -1193,7 +1348,11 @@ fn is_path_too_long(_path: &Path) -> bool {
 }
 
 /// Copie/déplacement de fichier ou dossier dans un dossier cible.
-fn copy_or_move(src: &Path, dest_dir: &Path, is_cut: bool) -> Result<(), String> {
+fn copy_or_move(
+    src: &Path,
+    dest_dir: &Path,
+    is_cut: bool,
+) -> Result<(), String> {
     if !dest_dir.exists() || !dest_dir.is_dir() {
         return Err(format!(
             "Destination invalide : {}",
@@ -1208,12 +1367,14 @@ fn copy_or_move(src: &Path, dest_dir: &Path, is_cut: bool) -> Result<(), String>
     }
 
     if is_cut && dest_dir.starts_with(src) {
-        return Err("Impossible de déplacer un dossier dans lui-même ou un sous-dossier.".to_string());
+        return Err(
+            "Impossible de déplacer un dossier dans lui-même ou un sous-dossier."
+                .to_string(),
+        );
     }
 
-    let file_name = src
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("unnamed"));
+    let file_name =
+        src.file_name().unwrap_or_else(|| OsStr::new("unnamed"));
     let dest_path = dest_dir.join(file_name);
 
     if is_path_too_long(&dest_path) {
