@@ -1,167 +1,232 @@
 # TreeSize Rust (Windows / Linux)
 
-Analyseur d’occupation disque inspiré de TreeSize / WinDirStat, écrit en **Rust** avec **eframe/egui** pour l’interface graphique.
+Analyseur d’occupation disque inspiré de **TreeSize** / **WinDirStat**, écrit en **Rust** avec **eframe/egui** pour l’interface graphique, et pensé pour un usage 100 % local.
 
-Ce projet est pensé pour un usage **local**, sur **Windows** et **Linux**, sans déploiement ni distribution commerciale.  
-Il permet de :
-
-- Scanner un **dossier** ou un **lecteur complet** (C:, D:, /, $HOME, …).
-- Visualiser les résultats :
-  - sous forme d’**arborescence triée par taille** ;
-  - sous forme de **treemap** (type WinDirStat).
-- Interagir avec le système de fichiers :
-  - **Propriétés** (afficher le chemin, la taille, le nombre de fichiers) ;
-  - **Copier le chemin** ;
-  - **Copier / Couper / Coller ici** (fichiers et dossiers) ;
-  - **Suppression** avec confirmation.
-- Gérer des scans lourds :
-  - **Scan parallèle** via `rayon` ;
-  - **Annulation coopérative** du scan ;
-  - Gestion d’erreurs d’accès et des chemins trop longs (Windows).
+> Objectif : comprendre rapidement ce qui prend de la place sur un disque (dossier, partition, disque complet) et agir dessus sans passer par un outil tiers ou un service en ligne.
 
 ---
 
-## 1. Fonctionnalités clés
+## Fonctionnalités
 
-### 1.1 Scan disque
+### Scan disque / dossier
 
-- Deux modes de scan :
-  - **Mode Dossier** : sélection d’un dossier via boîte de dialogue native.
-  - **Mode Lecteur** :
-    - Windows : détection des lecteurs C: à Z: existants.
-    - Linux/Unix : racine `/` + répertoire home.
-- Scan récursif du système de fichiers :
-  - Structure de données `Node` (dossier/fichier) avec :
-    - `name`, `path`, `is_dir`
-    - `size` (taille cumulée pour les dossiers)
-    - `file_count` (nombre total de fichiers descendants)
-    - `children` (sous-éléments)
+- Scan d’un **dossier** ou d’un **lecteur complet** :
+  - Sous Windows : `C:\`, `D:\`, etc.
+  - Sous Linux : `/`, `$HOME`, etc.
+- Scan **multithread** (via `rayon`) pour profiter des CPU multi-cœurs.
+- Gestion coopérative de l’annulation :
+  - Bouton **« Arrêter »** pour demander l’arrêt du scan.
+  - Les threads terminent proprement avant de renvoyer le résultat.
 
-### 1.2 Vue arborescente
+### Vue arborescente (Tree)
 
-- Vue hiérarchique **triée par taille décroissante**.
-- Pour chaque élément :
-  - Nom + taille formatée (Ko, Mo, Go, To)
-  - Pour les dossiers : nombre de fichiers et pourcentage de la racine.
-- Interactions (clic sur un élément) :
-  - **Clic gauche** : sélectionne le nœud (affichage dans le panneau latéral).
-  - **Clic droit** : ouvre un menu contextuel avec :
-    - `Propriétés`
-    - `Copier le chemin`
-    - `Copier` (presse-papier interne)
-    - `Couper`
-    - `Coller ici` (si un élément est dans le presse-papier)
-    - `Supprimer…` (avec fenêtre de confirmation)
+- Arborescence de dossiers/fichiers triée par **taille décroissante**.
+- Pour chaque entrée :
+  - Nom,
+  - Taille formatée (Ko / Mo / Go / To),
+  - Nombre de fichiers (pour les dossiers),
+  - Pourcentage par rapport à la racine scannée.
+- Clic gauche : sélectionne l’élément.
+- Clic droit : ouvre un **menu contextuel** avec :
+  - **Propriétés** (sélection dans le panneau à gauche),
+  - **Copier le chemin**,
+  - **Copier** / **Couper**,
+  - **Coller ici** (dans le dossier courant),
+  - **Supprimer…** (avec confirmation).
 
-### 1.3 Vue Treemap
+### Vue Treemap façon WinDirStat
 
-- Représentation graphique de l’occupation disque type **WinDirStat** :
-  - Chaque bloc représente un fichier ou un dossier.
-  - **Surface proportionnelle à la taille**.
-  - Coloration déterministe à partir du chemin (`color_for_path`).
-- Interactions :
-  - **Clic gauche** : sélectionne l’élément correspondant.
-  - **Survol** : affiche un tooltip détaillé (chemin, taille, pourcentage).
-  - **Clic droit** sur un bloc :
-    - `Propriétés`
-    - `Copier le chemin`
-    - `Copier` / `Couper`
-    - `Coller ici` :
-      - sur un dossier : colle à l’intérieur ;
-      - sur un fichier : colle dans le dossier parent du fichier.
-    - `Supprimer…` (avec confirmation).
+- Représentation graphique des dossiers/fichiers sous forme de **rectangles proportionnels à leur taille**.
+- Colorisation déterministe par chemin (même dossier ≈ même teinte).
+- Tooltip au survol :
+  - Nom,
+  - Chemin complet,
+  - Taille + pourcentage.
+- Clic gauche : sélectionne l’élément (synchro avec le panneau d’infos).
+- Clic droit : menu contextuel identique à l’arborescence (Propriétés, Copier chemin, Copier/Couper/Coller, Supprimer…).
 
-### 1.4 Opérations fichiers (copier / couper / coller / supprimer)
+### Presse-papier interne (fichiers / dossiers)
 
-- **Presse-papier interne** :
-  - Chemin stocké dans `clipboard_path`.
-  - Mode **Copier** ou **Couper** (`clipboard_is_cut`).
-- **Coller ici** :
-  - Utilise `pending_paste_dest` pour déclencher l’opération après le rendu.
-  - Appelle `handle_paste` → `copy_or_move`.
-- **Copie / Déplacement** (`copy_or_move`) :
-  - Validation des chemins source/destination.
-  - Protection contre le déplacement d’un dossier dans lui-même.
-  - Gestion des **chemins trop longs** sur Windows (`is_path_too_long`).
-  - Déplacement :
-    - tentative de `fs::rename` ;
-    - fallback **copie récursive + suppression** si nécessaire (cross-device).
-- **Suppression** (`delete_path`) :
-  - Fenêtre de confirmation dédiée.
-  - Dossiers : `remove_dir_all`.
-  - Fichiers : `remove_file`.
+- Possibilité de **copier** ou **couper** un fichier/dossier depuis :
+  - l’arborescence,
+  - la treemap,
+  - le panneau latéral.
+- **Coller ici** sur un dossier (ou sur un fichier → dans son parent).
+- Utilise :
+  - `fs::rename` pour le déplacement (avec fallback copie + suppression en cas de cross-device),
+  - copie récursive pour les dossiers,
+  - gestion des chemins trop longs sous Windows.
 
----
+### Suppression sécurisée
 
-## 2. Architecture technique
+- Bouton **« Supprimer… »** dans le menu contextuel.
+- Fenêtre de confirmation :
+  - Affiche le chemin complet,
+  - Message d’avertissement en rouge,
+  - Bouton Annuler / Supprimer.
+- Après suppression, un **rescan automatique** de la racine permet de rafraîchir les résultats.
 
-### 2.1 Technologies
+### Barre de progression du scan
 
-- Langage : **Rust**
-- GUI : **eframe** / **egui**
-- Concurrence / parallélisme :
-  - **rayon** pour le scan parallèle (`par_iter`).
-  - **crossbeam-channel** pour le retour de résultat de scan.
-  - **AtomicBool** + `Arc` pour l’annulation de scan.
-- Dialogues natifs : **rfd** (`pick_directory`).
-- Gestion des répertoires utilisateurs :
-  - **dirs** (uniquement côté Unix pour ajouter `$HOME`).
+Pour les scans volumineux (disque entier, gros SSD, etc.), le programme affiche une **progression en %** basée sur le volume de données à traiter :
 
-### 2.2 Composants principaux
+1. **Pré-analyse** (phase rapide) :
+   - Parcours du dossier / lecteur choisi,
+   - Calcul estimé de la **taille totale** de tous les fichiers (en octets),
+   - Cette valeur est utilisée comme référentiel pour la progression.
 
-- `TreeSizeApp` :
-  - Implémente `eframe::App`.
-  - Gère :
-    - L’état UI (mode de vue, sélection, panneau latéral).
-    - L’état du scan (en cours, annulé, terminé).
-    - Le presse-papier interne pour copier/coller.
-    - Les confirmations de suppression et les opérations différées (coller).
-- `Node` :
-  - Représente un dossier ou un fichier :
-    - Agrégation des tailles, tri par taille, structure hiérarchique.
-- Moteur de scan :
-  - `scan_directory_parallel(root, cancel)` :
-    - Construction de la hiérarchie.
-    - Annulation coopérative via `cancel: &AtomicBool`.
-  - `build_node(path, cancel)` :
-    - Différencie fichier/dossier.
-    - Scan récursif parallèle des sous-éléments.
-- Rendu des vues :
-  - Arborescence : `draw_node_recursive`.
-  - Treemap : `draw_treemap` + `layout_treemap_rect`.
+2. **Scan réel** :
+   - Construction de l’arbre des nœuds (`Node`),
+   - Pour chaque fichier scanné, le nombre d’octets est ajouté aux **octets scannés**.
+
+3. **Affichage** :
+   - Barre de progression + pourcentage dans :
+     - la **Top Bar**,
+     - le panneau **Actions**.
+   - Affichage également des valeurs :
+     - `scanné / total` (ex : `120.3 Go / 512.0 Go`).
+
+> Il ne s’agit pas d’une estimation de temps au sens strict, mais d’un bon indicateur de progression sur le **volume de données** traité.
 
 ---
 
-## 3. Installation & compilation
+## Stack technique
 
-### 3.1 Prérequis
+- **Langage** : Rust (édition 2021)
+- **UI** : [eframe/egui](https://github.com/emilk/egui)
+- **Parallélisation** : [rayon](https://crates.io/crates/rayon)
+- **Boîte de dialogue native** : [rfd](https://crates.io/crates/rfd)
+- **Gestion de canaux / threads** : [crossbeam-channel](https://crates.io/crates/crossbeam-channel)
+- **Gestion des dossiers utilisateurs** : [dirs](https://crates.io/crates/dirs)
 
-- **Rust stable** récent (via `rustup` recommandé).
-- Plateformes visées :
-  - Windows 10/11
-  - Linux (Ubuntu, Debian, etc.)
+Dependencies (extrait de `Cargo.toml`) :
 
-### 3.2 Récupération du projet
+```toml
+[dependencies]
+eframe = { version = "0.27", features = ["default"] }
+rayon = "1.10"
+rfd = "0.14"
+crossbeam-channel = "0.5"
+dirs = "5.0"
+```
+
+---
+
+## Installation & exécution
+
+### Prérequis
+
+- **Rust** (toolchain stable) + `cargo`  
+  → Installation recommandée via [rustup](https://rustup.rs).
+
+### Récupérer le projet
 
 ```bash
-git clone <url_du_repo> treesize_rust
+git clone <URL_DU_REPO> treesize_rust
 cd treesize_rust
 ```
 
-### 3.3 Compilation & exécution
+### Lancer en mode debug
 
-Mode debug:
 ```bash
 cargo run
 ```
 
-Mode release(recommandé pour les gros scans):
+### Lancer en mode release (recommandé)
+
 ```bash
 cargo run --release
 ```
 
-### 4. Utilisation
-- Lancer l’application :
-```bash
-cargo run --release
-```
+Le binaire final se trouvera dans :
+
+- `target/release/treesize_rust` (Linux),
+- `target\release\treesize_rust.exe` (Windows).
+
+Tu peux ensuite le placer dans un dossier présent dans ton `PATH` si tu veux l’utiliser comme un outil système.
+
+---
+
+## Utilisation
+
+1. **Choisir le mode de scan** (panneau gauche → section *Mode de scan*) :
+   - `Dossier` : choisir un dossier via le bouton **« Choisir un dossier… »**.
+   - `Lecteur` : sélectionner une racine (ex: `C:\` ou `/`) dans la liste.
+
+2. **Lancer le scan** :
+   - Cliquer sur **« Lancer le scan »**.
+   - Suivre la progression dans :
+     - la top bar (barre + pourcentage),
+     - le panneau **Actions**.
+
+3. **Explorer le résultat** :
+   - **Arborescence** :
+     - Parcourir les dossiers,
+     - Cliquer pour sélectionner un élément,
+     - Clic droit pour le menu contextuel.
+   - **Treemap** :
+     - Observer la distribution de l’espace disque,
+     - Survol pour voir les infos détaillées,
+     - Clic gauche / droit comme pour l’arborescence.
+
+4. **Opérations sur les fichiers/dossiers** :
+   - Via le menu contextuel ou le panneau de gauche :
+     - Copier / Couper / Coller,
+     - Supprimer (avec confirmation),
+     - Copier le chemin,
+     - Voir les propriétés (taille, nombre de fichiers, chemin complet).
+
+5. **Arrêter un scan en cours** :
+   - Bouton **« Arrêter »** dans la section *Actions* :
+     - Envoie un signal d’annulation,
+     - Les threads de scan se terminent proprement,
+     - L’UI reste réactive (redraw régulier).
+
+---
+
+## Limitations actuelles
+
+- Pas encore de :
+  - **Filtres avancés** (par taille minimale, extension, etc.),
+  - **Top N plus gros fichiers** dans un panneau dédié,
+  - **Résumé par extension**,
+  - **Comparaison entre deux scans**,
+  - **Détection de doublons**.
+- Le scan complet d’un gros disque peut prendre du temps (comme avec tout outil de ce type), mais :
+  - la progression en % donne un retour immédiat,
+  - l’annulation coopérative évite de “bloquer” la session.
+
+---
+
+## Roadmap / idées d’évolution
+
+Quelques pistes d’amélioration possibles :
+
+- **Top 100 plus gros fichiers** :
+  - Panneau dédié listant les plus gros fichiers du disque,
+  - Clic = focus dans l’arborescence / treemap.
+
+- **Filtres simples** :
+  - Taille minimale (ex: n’afficher que > 10 Mo),
+  - Pourcentage minimal (ex: n’afficher que > 1 % du total).
+
+- **Règles d’exclusion** :
+  - Patterns ignorés lors du scan (`node_modules`, `.git`, etc.),
+  - Configuration simple dans l’UI.
+
+- **Résumé par extension** :
+  - Tableau `extension -> taille totale / nb fichiers`,
+  - Filtre rapide par type de fichier.
+
+- **Comparaison de scans** :
+  - Sauvegarde / chargement de snapshots de scan,
+  - Diff entre deux états (fichiers ajoutés/supprimés / taille modifiée).
+
+- **Détection de doublons** :
+  - Hash des fichiers,
+  - Groupes de fichiers identiques, suppression guidée.
+
+---
+
+## Licence MIT
+
